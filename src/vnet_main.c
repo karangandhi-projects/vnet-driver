@@ -26,23 +26,167 @@
 #include <linux/spinlock.h>    /**< spinlock_t and related APIs */
 
 /**
+ * @brief Size of the transmit ring.
+ *
+ * This is the number of packets that can be queued for transmission
+ * at any given time. In a real NIC driver this is usually negotiated
+ * with the hardware (e.g. 256, 512, etc.).
+ */
+#define VNET_TX_RING_SIZE 64
+
+/**
+ * @brief Single transmit ring slot.
+ *
+ * Each slot in the TX ring holds one sk_buff pointer and a flag
+ * indicating whether the slot is currently in use.
+ */
+struct vnet_tx_slot {
+    struct sk_buff *skb;  /**< Packet buffer queued for transmission */
+    bool used;            /**< True if this slot is occupied */
+};
+
+/**
  * @brief Per-device private data for the vnet driver.
  *
  * One instance of this structure is allocated for each network interface
  * created by this driver. The memory is reserved by alloc_etherdev()
  * and accessed with netdev_priv().
- *
- * In later phases, this will hold TX/RX rings, statistics, timers, etc.
  */
 struct vnet_priv {
-    struct net_device *dev;    /**< Back-pointer to the associated net_device */
-    spinlock_t lock;           /**< Spinlock to protect shared state in the driver */
-    /* Future fields:
-     *   - TX/RX ring buffers
-     *   - Statistics counters
-     *   - NAPI structures
-     */
+    struct net_device *dev;                     /**< Back-pointer to the associated net_device */
+    spinlock_t lock;                            /**< Spinlock to protect shared state in the driver */
+
+    /* ------------------ TX ring state ------------------ */
+
+    struct vnet_tx_slot tx_ring[VNET_TX_RING_SIZE]; /**< Fixed-size circular buffer for TX packets */
+    u16 tx_head;                                    /**< Index where the next packet will be enqueued */
+    u16 tx_tail;                                    /**< Index where the next packet will be dequeued */
 };
+
+/**
+ * @brief Check if the TX ring is full.
+ *
+ * The ring is considered full if the slot at tx_head is already in use.
+ *
+ * @param priv Pointer to the driver's private data.
+ * @return true if the ring is full, false otherwise.
+ */
+static bool vnet_tx_ring_full(struct vnet_priv *priv)
+{
+    return priv->tx_ring[priv->tx_head].used;
+}
+
+/**
+ * @brief Check if the TX ring is empty.
+ *
+ * The ring is considered empty if the slot at tx_tail is not in use.
+ *
+ * @param priv Pointer to the driver's private data.
+ * @return true if the ring is empty, false otherwise.
+ */
+static bool vnet_tx_ring_empty(struct vnet_priv *priv)
+{
+    return !priv->tx_ring[priv->tx_tail].used;
+}
+
+/**
+ * @brief Initialize the TX ring.
+ *
+ * This function resets the ring indices and marks all slots as unused.
+ *
+ * @param priv Pointer to the driver's private data.
+ */
+static void vnet_tx_ring_init(struct vnet_priv *priv)
+{
+    int i;
+
+    priv->tx_head = 0;
+    priv->tx_tail = 0;
+
+    for (i = 0; i < VNET_TX_RING_SIZE; ++i) {
+        priv->tx_ring[i].skb = NULL;
+        priv->tx_ring[i].used = false;
+    }
+}
+
+/**
+ * @brief Enqueue a packet into the TX ring.
+ *
+ * If the ring is full, the function returns -ENOSPC and the caller
+ * is responsible for handling the failure (e.g. stop the TX queue).
+ *
+ * @param priv Pointer to the driver's private data.
+ * @param skb  Packet to enqueue.
+ * @return 0 on success, -ENOSPC if the ring is full.
+ */
+static int vnet_tx_enqueue(struct vnet_priv *priv, struct sk_buff *skb)
+{
+    struct vnet_tx_slot *slot;
+
+    if (vnet_tx_ring_full(priv))
+        return -ENOSPC;
+
+    slot = &priv->tx_ring[priv->tx_head];
+    slot->skb = skb;
+    slot->used = true;
+
+    priv->tx_head = (priv->tx_head + 1U) % VNET_TX_RING_SIZE;
+
+    return 0;
+}
+
+/**
+ * @brief Dequeue a packet from the TX ring.
+ *
+ * If the ring is empty, NULL is returned.
+ *
+ * @param priv Pointer to the driver's private data.
+ * @return Pointer to the dequeued sk_buff, or NULL if the ring is empty.
+ */
+static struct sk_buff *vnet_tx_dequeue(struct vnet_priv *priv)
+{
+    struct vnet_tx_slot *slot;
+    struct sk_buff *skb;
+
+    if (vnet_tx_ring_empty(priv))
+        return NULL;
+
+    slot = &priv->tx_ring[priv->tx_tail];
+    skb = slot->skb;
+
+    slot->skb = NULL;
+    slot->used = false;
+
+    priv->tx_tail = (priv->tx_tail + 1U) % VNET_TX_RING_SIZE;
+
+    return skb;
+}
+
+/**
+ * @brief Synchronous TX completion path (Phase 3).
+ *
+ * In a real driver, hardware would notify completion via interrupts
+ * or polling (NAPI). For learning purposes, we simulate immediate
+ * completion by draining the TX ring in a tight loop and freeing
+ * all queued packets.
+ *
+ * @param dev Pointer to the network device.
+ */
+static void vnet_tx_complete_all(struct net_device *dev)
+{
+    struct vnet_priv *priv = netdev_priv(dev);
+    struct sk_buff *skb;
+    unsigned int count = 0;
+
+    while ((skb = vnet_tx_dequeue(priv)) != NULL) {
+        dev_kfree_skb(skb);
+        count++;
+    }
+
+    if (count > 0)
+        pr_debug("vnet: completed %u TX packets\n", count);
+}
+
 
 /**
  * @brief Pointer to the single vnet device instance.
@@ -73,6 +217,15 @@ static struct net_device *vnet_dev;
  */
 static int vnet_open(struct net_device *dev)
 {
+    struct vnet_priv *priv = netdev_priv(dev);
+
+    /* Initialize the TX ring each time the device is opened. */
+    /* We use spin_lock_bh() instead of plain spin_lock() here since these paths can involve softirqs in real drivers. */
+    /* It’s a good habit for networking code. */
+    spin_lock_bh(&priv->lock);
+    vnet_tx_ring_init(priv);
+    spin_unlock_bh(&priv->lock);
+
     netif_start_queue(dev);    /* Enable the transmit queue so the stack can send packets */
     pr_info("vnet: device %s opened\n", dev->name);
     return 0;
@@ -94,7 +247,18 @@ static int vnet_open(struct net_device *dev)
  */
 static int vnet_stop(struct net_device *dev)
 {
+    struct vnet_priv *priv = netdev_priv(dev);
+    struct sk_buff *skb;
+
     netif_stop_queue(dev);     /* Disable the transmit queue to stop new packets */
+
+    /* Drain any remaining packets in the TX ring. */
+    spin_lock_bh(&priv->lock);
+    while ((skb = vnet_tx_dequeue(priv)) != NULL) {
+        dev_kfree_skb_any(skb);
+    }
+    spin_unlock_bh(&priv->lock);
+
     pr_info("vnet: device %s stopped\n", dev->name);
     return 0;
 }
@@ -116,26 +280,46 @@ static int vnet_stop(struct net_device *dev)
 static netdev_tx_t vnet_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
     struct vnet_priv *priv = netdev_priv(dev);
+    int ret;
 
-    /* Acquire the driver lock to protect shared data structures.
-     * This is mostly illustrative for now; future phases will have
-     * real shared state (rings, counters, etc.).
-     */
+    /* Acquire lock to protect the TX ring. */
     spin_lock(&priv->lock);
 
-    /* At this stage we do not forward packets anywhere.
-     * dev_kfree_skb() releases the sk_buff and its associated memory.
-     */
-    dev_kfree_skb(skb);
+    if (vnet_tx_ring_full(priv)) {
+        /* Ring is full: stop the queue and tell the stack to retry later. */
+        netif_stop_queue(dev);
+        spin_unlock(&priv->lock);
 
-    /* Release the lock after we're done touching shared state. */
+        pr_warn("vnet: TX ring full on %s, returning NETDEV_TX_BUSY\n", dev->name);
+        return NETDEV_TX_BUSY;
+    }
+
+    ret = vnet_tx_enqueue(priv, skb);
+    if (ret) {
+        /* Should not happen if vnet_tx_ring_full() was checked, but
+         * handle gracefully anyway.
+         */
+        spin_unlock(&priv->lock);
+        pr_err("vnet: failed to enqueue TX packet (err=%d)\n", ret);
+        dev_kfree_skb(skb);
+        return NETDEV_TX_OK;
+    }
+
+    /* For this learning phase, we simulate immediate TX completion by
+     * draining the ring synchronously. Later phases can move this to
+     * a workqueue, timer, or NAPI poll loop.
+     */
+    vnet_tx_complete_all(dev);
+
+    /* If there is space again in the ring, wake up the queue. */
+    if (!vnet_tx_ring_full(priv))
+        netif_wake_queue(dev);
+
     spin_unlock(&priv->lock);
 
-    /* Inform the networking stack that the packet was “transmitted”
-     * successfully, even though we just dropped it.
-     */
     return NETDEV_TX_OK;
 }
+
 
 /**
  * @brief net_device_ops structure for the vnet driver.

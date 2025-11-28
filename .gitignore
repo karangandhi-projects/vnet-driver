@@ -1,0 +1,23 @@
+# Kernel build files
+*.o
+*.ko
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+*.d
+*.cmd
+Module.symvers
+modules.order
+
+# Backup files
+*~
+*.swp
+
+# Doxygen output
+docs/html/
+docs/latex/
+
+# VSCode / IDE
+.vscode/
+

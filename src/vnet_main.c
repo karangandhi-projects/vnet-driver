@@ -27,6 +27,8 @@
 #include <linux/spinlock.h>    /**< spinlock_t and related APIs */
 #include <linux/timer.h>       /**< Kernel timers: struct timer_list, mod_timer(), etc. */
 #include <linux/string.h>      /**< String helpers like strlen(), memcpy() */
+#include <linux/skbuff.h>      /**< SKB helpers (skb_reset_*, etc.) */
+#include <linux/if_ether.h>    /**< Ethernet protocol types like ETH_P_IP */
 
 /**
  * @brief Size of the transmit ring.
@@ -91,6 +93,11 @@ struct vnet_priv {
     struct vnet_rx_slot rx_ring[VNET_RX_RING_SIZE]; /**< Fixed-size circular buffer for RX packets */
     u16 rx_head;                                    /**< Index where the next packet will be written */
     u16 rx_tail;                                    /**< Index where the next packet will be read */
+
+   /* ------------------ NAPI / RX scheduling ----------- */
+
+    struct napi_struct napi;                       /**< NAPI context used for RX polling */
+
 
     /* ------------------ RX packet generator ------------ */
 
@@ -326,30 +333,67 @@ static struct sk_buff *vnet_rx_dequeue(struct vnet_priv *priv)
 }
 
 /**
- * @brief Process all packets currently queued in the RX ring.
+ * @brief NAPI poll function for the vnet driver.
  *
- * In a production driver this function (or NAPI poll) would deliver
- * packets to the networking stack via netif_receive_skb() or variants.
- * For learning purposes, we simply log and free each packet.
+ * This function is invoked by the networking core when NAPI is scheduled.
+ * It drains packets from the RX ring (up to @p budget packets) and, for
+ * each packet, hands it to the networking stack.
  *
- * @param dev Pointer to the network device.
+ * In a production driver, this would be invoked after an RX interrupt
+ * disables further interrupts and schedules NAPI. Once the ring is empty,
+ * napi_complete_done() is called so interrupts can be re-enabled.
+ *
+ * @param napi   Pointer to the NAPI context.
+ * @param budget Maximum number of packets to process in this poll cycle.
+ *
+ * @return Number of packets actually processed.
  */
-static void vnet_rx_process_all(struct net_device *dev)
+static int vnet_napi_poll(struct napi_struct *napi, int budget)
 {
-    struct vnet_priv *priv = netdev_priv(dev);
+    struct vnet_priv *priv = container_of(napi, struct vnet_priv, napi);
+    struct net_device *dev = priv->dev;
     struct sk_buff *skb;
-    unsigned int count = 0;
+    int work_done = 0;
 
-    while ((skb = vnet_rx_dequeue(priv)) != NULL) {
-        pr_debug("vnet: RX packet of length %u bytes on %s\n",
-                 skb->len, dev->name);
+    while (work_done < budget) {
+        /* Dequeue one packet from the RX ring under the lock. */
+        spin_lock(&priv->lock);
+        skb = vnet_rx_dequeue(priv);
+        spin_unlock(&priv->lock);
 
-        dev_kfree_skb_any(skb);
-        count++;
+        if (!skb)
+            break; /* No more packets available. */
+
+        /* Attach metadata so the stack knows how to handle the packet.
+         * Our payload is just a dummy string, so this is purely for
+         * demonstration. In a real driver the skb would contain a
+         * proper Ethernet frame.
+         */
+        skb->dev = dev;
+        skb_reset_mac_header(skb);
+        skb_reset_network_header(skb);
+        skb->protocol = htons(ETH_P_IP);  /* Dummy protocol tag. */
+        skb->ip_summed = CHECKSUM_NONE;
+
+        /* Hand the packet to the networking stack. The stack will
+         * free the skb once it is done.
+         */
+        netif_rx(skb);
+
+        work_done++;
     }
 
-    if (count > 0)
-        pr_info("vnet: processed %u RX packets on %s\n", count, dev->name);
+    /* If we processed fewer packets than the budget, the ring is (for now)
+     * empty and we can complete this NAPI round.
+     */
+    if (work_done < budget) {
+        napi_complete_done(napi, work_done);
+        /* In a real driver, RX interrupts would be re-enabled here. */
+    }
+    
+    pr_info("vnet: NAPI poll processed %d packets on %s\n", work_done, dev->name);
+
+    return work_done;
 }
 
 /**
@@ -357,7 +401,8 @@ static void vnet_rx_process_all(struct net_device *dev)
  *
  * This function is called periodically by the kernel timer. It simulates
  * incoming packets by allocating an sk_buff with a small text payload,
- * enqueuing it into the RX ring, and then processing the ring.
+ * enqueuing it into the RX ring, and then scheduling NAPI to process
+ * the ring.
  *
  * @param t Pointer to the timer_list embedded in vnet_priv.
  */
@@ -390,16 +435,19 @@ static void vnet_rx_timer_fn(struct timer_list *t)
         goto out_rearm;
     }
 
-    /* Process everything currently in the RX ring.
-     * In a later phase this will be replaced with NAPI scheduling.
+    /* Schedule NAPI to process the RX ring. In a real driver this
+     * would usually be done from an RX interrupt handler.
      */
-    vnet_rx_process_all(dev);
+    if (napi_schedule_prep(&priv->napi))
+        __napi_schedule(&priv->napi);
+
     spin_unlock(&priv->lock);
 
 out_rearm:
     /* Rearm the timer to fire again in 1 second. */
     mod_timer(&priv->rx_timer, jiffies + msecs_to_jiffies(1000));
 }
+
 
 
 /**
@@ -417,14 +465,8 @@ static struct net_device *vnet_dev;
 /**
  * @brief Open callback for the network device.
  *
- * This function is called by the kernel when the interface is brought up,
- * for example via:
- *
- *   ip link set vnet0 up
- *
- * Typical responsibilities here include starting the TX queue and
- * initializing hardware. Since this is a virtual device, we only start
- * the queue, initialize our rings, and start the RX timer.
+ * Initializes TX/RX rings, enables NAPI, and starts the RX timer used
+ * to simulate incoming packets.
  *
  * @param dev Pointer to the network device being opened.
  * @return 0 on success, negative error code on failure.
@@ -439,11 +481,14 @@ static int vnet_open(struct net_device *dev)
     vnet_rx_ring_init(priv);
     spin_unlock_bh(&priv->lock);
 
+    /* Enable NAPI so RX processing can run in poll context. */
+    napi_enable(&priv->napi);
+
     /* Set up and start the RX timer to simulate incoming packets. */
     timer_setup(&priv->rx_timer, vnet_rx_timer_fn, 0);
     mod_timer(&priv->rx_timer, jiffies + msecs_to_jiffies(1000));
 
-    netif_start_queue(dev);    /**< Enable the transmit queue so the stack can send packets */
+    netif_start_queue(dev);
     pr_info("vnet: device %s opened\n", dev->name);
     return 0;
 }
@@ -451,14 +496,8 @@ static int vnet_open(struct net_device *dev)
 /**
  * @brief Stop callback for the network device.
  *
- * This function is called by the kernel when the interface is brought
- * down, for example via:
- *
- *   ip link set vnet0 down
- *
- * Typical responsibilities include stopping the TX queue and shutting
- * down hardware. Here we stop the queue, cancel the RX timer, and
- * drain all pending packets from TX and RX rings.
+ * Stops the TX queue, disables NAPI, cancels the RX timer, and drains
+ * any remaining packets from both TX and RX rings.
  *
  * @param dev Pointer to the network device being stopped.
  * @return 0 on success, negative error code on failure.
@@ -468,23 +507,29 @@ static int vnet_stop(struct net_device *dev)
     struct vnet_priv *priv = netdev_priv(dev);
     struct sk_buff *skb;
 
-    netif_stop_queue(dev);     /**< Disable the transmit queue to stop new packets */
+    netif_stop_queue(dev);     /* Disable the transmit queue to stop new packets */
+
+    /* Disable NAPI before tearing down RX state. */
+    napi_disable(&priv->napi);
 
     /* Stop the RX timer and wait for any running callback. */
     del_timer_sync(&priv->rx_timer);
 
     /* Drain any remaining packets in the TX and RX rings. */
     spin_lock_bh(&priv->lock);
+
     while ((skb = vnet_tx_dequeue(priv)) != NULL)
         dev_kfree_skb_any(skb);
 
     while ((skb = vnet_rx_dequeue(priv)) != NULL)
         dev_kfree_skb_any(skb);
+
     spin_unlock_bh(&priv->lock);
 
     pr_info("vnet: device %s stopped\n", dev->name);
     return 0;
 }
+
 
 /**
  * @brief Transmit callback for the network device.
@@ -607,6 +652,15 @@ static int __init vnet_init(void)
     priv = netdev_priv(vnet_dev);
     priv->dev = vnet_dev;
     spin_lock_init(&priv->lock);
+   
+    /* Register NAPI context for RX polling.
+     * On this kernel, netif_napi_add() takes only three arguments:
+     *   - device
+     *   - napi struct
+     *   - poll function
+     * The weight defaults to NAPI_POLL_WEIGHT.
+     */
+    netif_napi_add(vnet_dev, &priv->napi, vnet_napi_poll);
 
     /**
      * Set the hardware (MAC) address for this net_device.
@@ -639,10 +693,16 @@ static int __init vnet_init(void)
 static void __exit vnet_exit(void)
 {
     if (vnet_dev) {
-        pr_info("vnet: unregistering device %s\n", vnet_dev->name);
-        unregister_netdev(vnet_dev);
-        free_netdev(vnet_dev);
-        vnet_dev = NULL;
+	 struct vnet_priv *priv = netdev_priv(vnet_dev);
+
+	 pr_info("vnet: unregistering device %s\n", vnet_dev->name);
+
+    	/* Remove NAPI context before freeing the device. */
+    	netif_napi_del(&priv->napi);
+
+    	unregister_netdev(vnet_dev);
+    	free_netdev(vnet_dev);
+    	vnet_dev = NULL;
     }
 }
 

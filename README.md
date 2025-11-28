@@ -30,6 +30,13 @@ This project is designed to teach modern Linux kernel driver development
 step-by-step.
 
 ------------------------------------------------------------------------
+## ✨ Features Completed (Phase 3)
+
+- Everything from Phase 2, plus:
+  - Fixed-size TX ring buffer (`VNET_TX_RING_SIZE`)
+  - Ring management helpers (enqueue/dequeue/init)
+  - `ndo_start_xmit` now uses the TX ring instead of dropping directly
+  - Proper handling of `NETDEV_TX_BUSY` and `netif_stop_queue()/netif_wake_queue()`
 
 ## ✨ Features Completed (Phase 2)
 

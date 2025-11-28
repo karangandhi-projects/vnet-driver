@@ -1,139 +1,168 @@
-# 📦 vnet – Virtual Network Driver for Linux  
-*A fully handcrafted Linux kernel network driver built from scratch.*
+# 📦 vnet-driver — Virtual Linux Network Driver (Educational Project)
 
-This project implements a **virtual Ethernet NIC** as a loadable Linux kernel module.  
-It is intentionally designed like a **real-world production driver**, with:
+### **Author:** Karan Gandhi  
+### **Status:** Phase 6 Complete (TX/RX Rings, NAPI, Stats, ethtool)  
+### **License:** GPL-2.0  
 
-- TX ring buffer  
-- RX ring buffer  
-- Timer-based packet generation  
-- **NAPI-based RX polling** (Phase 5)  
-- Clean modular architecture  
-- Proper net_device operations  
-- Doxygen-ready documentation  
-- CI + PR pipeline  
-- Feature-branch workflow  
+---
 
-The goal is to demonstrate **real Linux networking driver engineering**, matching the architecture of drivers like Intel e1000e, ixgbe, Mellanox mlx5, or Qualcomm WiFi.
+# 📘 Overview
+
+This repository contains a fully documented, educational Linux kernel  
+**virtual Ethernet driver** (`vnet0`).  
+You build the driver step-by-step—exactly like real NIC driver development.
+
+The project evolves through milestones (“phases”), each adding a real capability found in production drivers such as Intel e1000, Realtek r8169, mlx5, etc.
 
 ---
 
 # 🚗 Project Roadmap (Phases)
 
-| Phase | Feature | Status |
-|-------|---------|--------|
-| **1** | Basic module + net_device registration | ✅ Done |
-| **2** | Minimal NIC (`vnet0`) appearing in `ip link` | ✅ Done |
-| **3** | TX ring buffer + real `ndo_start_xmit` path | ✅ Done |
+| Phase | Description | Status |
+|-------|-------------|--------|
+| **1** | Basic kernel module | ✅ Done |
+| **2** | Minimal net_device skeleton | ✅ Done |
+| **3** | TX ring buffer | ✅ Done |
 | **4** | RX ring + timer-based packet generator | ✅ Done |
-| **5** | **NAPI-based RX polling (real NIC behavior)** | ✅ Done |
-| 6 | ethtool ops (driver info, stats) | ⏳ Next |
-| 7 | More realistic Ethernet frames | ⏳ Planned |
-| 8 | Userspace backend (ioctl / netlink) | ⏳ Future |
+| **5** | NAPI-based RX polling | ✔️ Done |
+| **6** | Driver statistics + basic ethtool support | ✔️ Done |
+| **7** | Documentation & Architecture diagrams | ⏳ Upcoming |
+| **8** | Userspace backend (netlink/ioctl) | ⏳ Future |
 
 ---
 
 # ✨ Features Completed
 
-## 🟦 Phase 1 — Basic Module + net_device Skeleton
-- Minimal kernel module.
-- Allocates Ethernet device using `alloc_etherdev()`.
-- Registers/unregisters net_device.
-- Hard-coded MAC address.
+## 🟦 Phase 1 — Basic Module
+- Loads/unloads cleanly  
+- Prints initialization message  
 
 ---
 
-## 🟩 Phase 2 — Minimal Virtual NIC
-- Device appears as `vnet0`.
-- Supports:
-  - `ip link set vnet0 up`
-  - `ip link set vnet0 down`
-- Packets dropped but interface is operational.
+## 🟩 Phase 2 — Register a Virtual Ethernet Device
+- `alloc_etherdev()` to create `struct net_device`  
+- Implemented `net_device_ops`:  
+  - `ndo_open`  
+  - `ndo_stop`  
+  - `ndo_start_xmit`  
+- Custom MAC address using `eth_hw_addr_set()`  
+- Interface appears as:  
+  ```bash
+  ip link show vnet0
+  ```
 
 ---
 
 ## 🟨 Phase 3 — TX Ring Buffer
-
-### Implemented:
-- Fixed-size TX ring (`VNET_TX_RING_SIZE`)
-- Circular queue with:
-  - `tx_head`
-  - `tx_tail`
-- Safe locking using `spin_lock_bh()`
-- `ndo_start_xmit()` now:
-  - Enqueues SKBs into TX ring  
-  - Simulates asynchronous TX completion
+- Added circular TX queue (`VNET_TX_RING_SIZE`)  
+- Helpers for enqueue/dequeue  
+- Spinlock-based protection  
+- Proper queue-stop + busy handling  
+- Simulated TX completion  
 
 ---
 
 ## 🟧 Phase 4 — RX Ring + Timer-Based Packet Generator
-
-### Implemented:
-- RX ring (`VNET_RX_RING_SIZE`)
-- RX enqueue/dequeue helpers
-- Kernel timer to simulate RX interrupts
-- Timer generates a dummy SKB every second and enqueues it into RX ring
+- Added RX ring (`VNET_RX_RING_SIZE`)  
+- Kernel timer generates packets every 1s  
+- Dummy payload: `"Hello from vnet RX"`  
+- Prepares for NAPI polling in next phase  
 
 ---
 
-# 🟥 Phase 5 — **NAPI-Based RX Polling** (Real NIC behavior)
+## 🟥 Phase 5 — NAPI-Based RX Polling
+- Added NAPI support via `vnet_napi_poll()`  
+- Timer mimics hardware interrupt:
+  - Allocates fake SKB  
+  - Enqueues it  
+  - Schedules NAPI  
+- RX processed inside poll loop  
+- Packets delivered to kernel via `netif_rx()`  
+- Prevents interrupt storms and increases throughput  
 
-### Implemented:
-- Added `struct napi_struct napi` to `vnet_priv`
-- Created `vnet_napi_poll()` to drain RX ring in poll context
-- Registered NAPI with:
-  ```c
-  netif_napi_add(dev, &priv->napi, vnet_napi_poll);
-  ```
-- Enabled NAPI on device open, disabled on close
-- Updated RX timer to:
-  - Allocate packet
-  - Enqueue into RX ring
-  - Schedule NAPI
-- Removed old direct RX processing helper
+---
 
-### Why NAPI?
-NAPI improves performance by preventing interrupt storms.  
-It switches from interrupt-driven RX to **polling** when traffic increases.
+## 🟪 Phase 6 — Driver Statistics & ethtool Support
 
-### NAPI Flow:
+### ✔ Added 64-bit statistics
+Counters added:
+- `tx_packets`, `tx_bytes`, `tx_dropped`  
+- `rx_packets`, `rx_bytes`, `rx_dropped`  
+
+Exposed through:
+```bash
+ip -s link show vnet0
 ```
-Timer → enqueue RX packet → schedule NAPI
-NAPI → drain RX ring → netif_rx() → kernel stack
+
+### ✔ Implemented `ndo_get_stats64`
+Linux reads counters via kernel networking stack.
+
+### ✔ Basic ethtool support
+```bash
+ethtool -i vnet0
+ethtool vnet0
+```
+
+Reports:
+- driver: vnet  
+- version: 0.6  
+- bus-info: virtual  
+- link detected: yes  
+
+---
+
+# 📂 Repository Structure
+
+```
+vnet-driver/
+├── src/
+│   ├── vnet_main.c
+│   └── Makefile
+├── docs/
+│   └── architecture.md   # Coming in Phase 7
+├── README.md
+└── LICENSE
 ```
 
 ---
 
-# 🔧 Build & Test
+# 🛠️ Building the Module
 
-### Build:
+Install kernel headers:
+```bash
+sudo apt install build-essential linux-headers-$(uname -r)
+```
+
+Build:
 ```bash
 make
 ```
 
-### Load:
-```bash
-cd src
-sudo insmod vnet_main.ko
-sudo ip link set vnet0 up
-sudo ip addr add 10.0.0.1/24 dev vnet0
+Output:
 ```
-
-### Logs:
-```bash
-sudo dmesg -w | grep vnet
-```
-
-### Disable:
-```bash
-sudo ip link set vnet0 down
+src/vnet_main.ko
 ```
 
 ---
 
-# 🧪 Debugging
+# ▶️ Loading the Driver
 
-Enable debug:
+```bash
+sudo insmod src/vnet_main.ko
+sudo ip link set vnet0 up
+sudo ip addr add 10.0.0.1/24 dev vnet0
+```
+
+Unload:
+```bash
+sudo rmmod vnet_main
+```
+
+---
+
+# 🔧 Debugging with Dynamic Debug
+
+Enable:
 ```bash
 echo 'module vnet_main +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 ```
@@ -145,23 +174,28 @@ echo 'module vnet_main -p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 
 ---
 
-# 📁 Directory Structure
+# 🎯 Learning Objectives
 
-```
-vnet-driver/
- ├── src/
- │    ├── vnet_main.c
- │    ├── Makefile
- ├── docs/
- ├── README.md
- └── LICENSE
-```
+This project teaches:
+- Linux kernel modules  
+- net_device architecture  
+- TX/RX ring buffers  
+- Kernel timers  
+- NAPI  
+- Packet scheduling  
+- ethtool driver introspection  
+- Concurrency (spinlocks)  
+- Clean GitHub CI & PR workflows  
 
 ---
 
-# 📘 Version History
+# 🚀 Upcoming Work
 
-- **v0.2** — Basic NIC  
-- **v0.3** — TX ring  
-- **v0.4** — RX ring + timer  
-- **v0.5** — NAPI-based RX polling
+- Architecture diagrams (Phase 7)  
+- Userspace backend (Phase 8)  
+- More advanced ethtool ops  
+- More realistic Ethernet frame building  
+
+---
+
+⭐ If this helped you learn Linux driver development, consider starring the repo!

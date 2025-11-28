@@ -1,22 +1,27 @@
 /**
  * @file vnet_main.c
- * @brief Minimal virtual Ethernet network driver (Phase 4: TX/RX rings and timer-based RX).
+ * @brief Virtual Ethernet network driver (Phases 2–6: TX/RX rings, NAPI, stats).
  *
  * This module registers a simple virtual network interface (e.g. vnet0)
- * and wires up basic net_device operations (open/stop/start_xmit).
+ * and wires up core net_device operations (open/stop/start_xmit), NAPI,
+ * and basic ethtool support.
  *
  * At this stage, the driver:
- *   - Allocates a struct net_device with private data.
+ *   - Allocates a struct net_device with private data (vnet_priv).
  *   - Registers the device with the kernel networking stack.
- *   - Exposes a virtual interface visible via "ip link".
- *   - Implements a TX ring to queue outgoing packets.
- *   - Implements an RX ring fed by a timer that simulates incoming packets.
- *   - Still drops all packets instead of handing them to the networking stack (learning phase).
+ *   - Exposes a virtual interface visible via "ip link" (vnet0).
+ *   - Implements TX and RX ring buffers protected by a spinlock.
+ *   - Uses a kernel timer to simulate RX "interrupts" by generating packets.
+ *   - Uses NAPI to poll the RX ring and deliver packets to the stack via netif_rx().
+ *   - Tracks simple TX/RX statistics (packets/bytes/drops) and exposes them to userspace.
+ *   - Provides basic ethtool hooks (driver info, link status).
  *
- * Later phases will add:
- *   - NAPI integration and real packet delivery to the networking stack.
+ * Future phases may add:
+ *   - More realistic Ethernet frames and protocol handling.
+ *   - Additional ethtool operations and extended statistics.
  *   - A user-space backend to exchange packets.
  */
+
 
 #include <linux/module.h>      /**< Kernel module macros: module_init, module_exit, MODULE_* */
 #include <linux/kernel.h>      /**< Kernel logging helpers like pr_info(), pr_err() */
@@ -29,6 +34,8 @@
 #include <linux/string.h>      /**< String helpers like strlen(), memcpy() */
 #include <linux/skbuff.h>      /**< SKB helpers (skb_reset_*, etc.) */
 #include <linux/if_ether.h>    /**< Ethernet protocol types like ETH_P_IP */
+#include <linux/ethtool.h>     /**< ethtool_ops, ethtool driver hooks */
+#include <linux/rtnetlink.h>   /**< rtnl_link_stats64 for ndo_get_stats64 */
 
 /**
  * @brief Size of the transmit ring.
@@ -79,8 +86,8 @@ struct vnet_rx_slot {
  * and accessed with netdev_priv().
  */
 struct vnet_priv {
-    struct net_device *dev;                     /**< Back-pointer to the associated net_device */
-    spinlock_t lock;                            /**< Spinlock to protect shared state in the driver */
+    struct net_device *dev;                        /**< Back-pointer to the associated net_device */
+    spinlock_t lock;                               /**< Spinlock to protect shared state in the driver */
 
     /* ------------------ TX ring state ------------------ */
 
@@ -94,14 +101,24 @@ struct vnet_priv {
     u16 rx_head;                                    /**< Index where the next packet will be written */
     u16 rx_tail;                                    /**< Index where the next packet will be read */
 
-   /* ------------------ NAPI / RX scheduling ----------- */
+    /* ------------------ NAPI / RX scheduling ----------- */
 
-    struct napi_struct napi;                       /**< NAPI context used for RX polling */
+    struct napi_struct napi;                        /**< NAPI context used for RX polling */
 
 
     /* ------------------ RX packet generator ------------ */
 
     struct timer_list rx_timer;                     /**< Timer that simulates incoming packets */
+
+    /* ------------------ Statistics --------------------- */
+
+    u64 tx_packets;                                 /**< Number of successfully transmitted packets */
+    u64 tx_bytes;                                   /**< Number of bytes successfully transmitted */
+    u64 tx_dropped;                                 /**< Number of TX packets dropped by the driver */
+
+    u64 rx_packets;                                 /**< Number of successfully received packets */
+    u64 rx_bytes;                                   /**< Number of bytes successfully received */
+    u64 rx_dropped;                                 /**< Number of RX packets dropped by the driver */
 };
 
 
@@ -364,11 +381,13 @@ static int vnet_napi_poll(struct napi_struct *napi, int budget)
         if (!skb)
             break; /* No more packets available. */
 
-        /* Attach metadata so the stack knows how to handle the packet.
-         * Our payload is just a dummy string, so this is purely for
-         * demonstration. In a real driver the skb would contain a
-         * proper Ethernet frame.
-         */
+        /* Update RX statistics before handing the packet to the stack. */
+        spin_lock(&priv->lock);
+        priv->rx_packets++;
+        priv->rx_bytes += skb->len;
+        spin_unlock(&priv->lock);
+
+        /* Attach metadata so the stack knows how to handle the packet. */
         skb->dev = dev;
         skb_reset_mac_header(skb);
         skb_reset_network_header(skb);
@@ -383,18 +402,14 @@ static int vnet_napi_poll(struct napi_struct *napi, int budget)
         work_done++;
     }
 
-    /* If we processed fewer packets than the budget, the ring is (for now)
-     * empty and we can complete this NAPI round.
-     */
     if (work_done < budget) {
         napi_complete_done(napi, work_done);
         /* In a real driver, RX interrupts would be re-enabled here. */
     }
-    
-    pr_info("vnet: NAPI poll processed %d packets on %s\n", work_done, dev->name);
 
     return work_done;
 }
+
 
 /**
  * @brief RX timer callback: simulate incoming packets.
@@ -418,6 +433,10 @@ static void vnet_rx_timer_fn(struct timer_list *t)
     /* Allocate an sk_buff with room for our dummy payload. */
     skb = netdev_alloc_skb_ip_align(dev, msg_len);
     if (!skb) {
+        spin_lock(&priv->lock);
+        priv->rx_dropped++;
+        spin_unlock(&priv->lock);
+
         pr_warn("vnet: RX timer failed to allocate skb\n");
         goto out_rearm;
     }
@@ -430,10 +449,15 @@ static void vnet_rx_timer_fn(struct timer_list *t)
     ret = vnet_rx_enqueue(priv, skb);
     if (ret) {
         spin_unlock(&priv->lock);
+        spin_lock(&priv->lock);
+        priv->rx_dropped++;
+        spin_unlock(&priv->lock);
+
         pr_warn("vnet: RX ring full, dropping simulated packet\n");
         dev_kfree_skb_any(skb);
         goto out_rearm;
     }
+
 
     /* Schedule NAPI to process the RX ring. In a real driver this
      * would usually be done from an RX interrupt handler.
@@ -479,6 +503,13 @@ static int vnet_open(struct net_device *dev)
     spin_lock_bh(&priv->lock);
     vnet_tx_ring_init(priv);
     vnet_rx_ring_init(priv);
+    /* Reset statistics on open to start a fresh session. */
+    priv->tx_packets = 0;
+    priv->tx_bytes   = 0;
+    priv->tx_dropped = 0;
+    priv->rx_packets = 0;
+    priv->rx_bytes   = 0;
+    priv->rx_dropped = 0;
     spin_unlock_bh(&priv->lock);
 
     /* Enable NAPI so RX processing can run in poll context. */
@@ -550,11 +581,16 @@ static netdev_tx_t vnet_start_xmit(struct sk_buff *skb, struct net_device *dev)
     struct vnet_priv *priv = netdev_priv(dev);
     int ret;
 
+    /* Acquire lock to protect the TX ring and statistics. */
     spin_lock(&priv->lock);
 
     if (vnet_tx_ring_full(priv)) {
         /* Ring is full: stop the queue and tell the stack to retry later. */
         netif_stop_queue(dev);
+
+        /* Count this as a dropped TX packet. */
+        priv->tx_dropped++;
+
         spin_unlock(&priv->lock);
 
         pr_warn("vnet: TX ring full on %s, returning NETDEV_TX_BUSY\n", dev->name);
@@ -566,11 +602,16 @@ static netdev_tx_t vnet_start_xmit(struct sk_buff *skb, struct net_device *dev)
         /* Should not happen if vnet_tx_ring_full() was checked, but
          * handle gracefully anyway.
          */
+        priv->tx_dropped++;
         spin_unlock(&priv->lock);
-        pr_err("vnet: failed to enqueue TX packet on %s (ret=%d)\n", dev->name, ret);
-        dev_kfree_skb_any(skb);
+        pr_err("vnet: failed to enqueue TX packet (err=%d)\n", ret);
+        dev_kfree_skb(skb);
         return NETDEV_TX_OK;
     }
+
+    /* Update TX statistics on successful enqueue. */
+    priv->tx_packets++;
+    priv->tx_bytes += skb->len;
 
     /* For this learning phase, we simulate immediate TX completion by
      * draining the ring synchronously. Later phases can move this to
@@ -588,6 +629,34 @@ static netdev_tx_t vnet_start_xmit(struct sk_buff *skb, struct net_device *dev)
 }
 
 /**
+ * @brief Retrieve device statistics (64-bit).
+ *
+ * This callback populates @p stats with the driver's internal counters so
+ * that tools like "ip -s link" can display TX/RX packet and byte counts.
+ *
+ * @param dev   Pointer to the network device.
+ * @param stats Pointer to the rtnl_link_stats64 structure to fill in.
+ */
+static void vnet_get_stats64(struct net_device *dev,
+                             struct rtnl_link_stats64 *stats)
+{
+    struct vnet_priv *priv = netdev_priv(dev);
+
+    /* Protect statistics with the same lock used for updates. */
+    spin_lock_bh(&priv->lock);
+
+    stats->rx_packets = priv->rx_packets;
+    stats->rx_bytes   = priv->rx_bytes;
+    stats->rx_dropped = priv->rx_dropped;
+
+    stats->tx_packets = priv->tx_packets;
+    stats->tx_bytes   = priv->tx_bytes;
+    stats->tx_dropped = priv->tx_dropped;
+
+    spin_unlock_bh(&priv->lock);
+}
+
+/**
  * @brief net_device_ops structure for the vnet driver.
  *
  * This table connects the generic networking stack to our driver-specific
@@ -598,9 +667,50 @@ static const struct net_device_ops vnet_netdev_ops = {
     .ndo_open       = vnet_open,       /**< Called when the interface is brought up */
     .ndo_stop       = vnet_stop,       /**< Called when the interface is brought down */
     .ndo_start_xmit = vnet_start_xmit, /**< Called to transmit a packet */
+    .ndo_get_stats64 = vnet_get_stats64, /**< Provide 64-bit TX/RX statistics */
     /* Additional operations (set_mac_address, change_mtu, etc.) can be
      * added here in later phases if needed.
      */
+};
+
+/**
+ * @brief Fill basic driver information for ethtool.
+ *
+ * This callback is used by "ethtool -i vnet0" to display the driver name,
+ * version, and bus information.
+ *
+ * @param dev  Pointer to the network device.
+ * @param info Pointer to the structure to fill in.
+ */
+static void vnet_get_drvinfo(struct net_device *dev,
+                             struct ethtool_drvinfo *info)
+{
+    strscpy(info->driver,  "vnet", sizeof(info->driver));
+    strscpy(info->version, "0.6", sizeof(info->version));
+    strscpy(info->bus_info, "virtual", sizeof(info->bus_info));
+}
+
+/**
+ * @brief Report link status for ethtool.
+ *
+ * This virtual device always reports the link as up.
+ *
+ * @param dev Pointer to the network device.
+ * @return 1 if link is up, 0 otherwise.
+ */
+static u32 vnet_get_link(struct net_device *dev)
+{
+    return 1;
+}
+
+/**
+ * @brief ethtool operations for the vnet driver.
+ *
+ * This table is used by ethtool to query basic driver information.
+ */
+static const struct ethtool_ops vnet_ethtool_ops = {
+    .get_drvinfo = vnet_get_drvinfo,
+    .get_link    = vnet_get_link,
 };
 
 /* ====================================================================== */
@@ -647,6 +757,9 @@ static int __init vnet_init(void)
 
     /* Hook up our net_device_ops. */
     vnet_dev->netdev_ops = &vnet_netdev_ops;
+
+    /* Connect ethtool operations so that "ethtool" can query this driver. */
+    vnet_dev->ethtool_ops = &vnet_ethtool_ops;
 
     /* Initialize the private data area. */
     priv = netdev_priv(vnet_dev);
@@ -711,6 +824,6 @@ module_exit(vnet_exit);  /**< Register vnet_exit() as the module's exit point */
 
 MODULE_LICENSE("GPL");           /**< License: required to avoid "tainting" the kernel */
 MODULE_AUTHOR("Karan Gandhi");   /**< Author name for documentation and diagnostics */
-MODULE_DESCRIPTION("Minimal virtual network device (vnet0) - Phase 4 (TX/RX rings, timer-based RX)");
-MODULE_VERSION("0.4");           /**< Driver version string */
+MODULE_DESCRIPTION("Virtual network device (vnet0) - Phases 2-6: TX/RX rings, NAPI, stats, ethtool");
+MODULE_VERSION("0.6");           /**< Driver version string */
 

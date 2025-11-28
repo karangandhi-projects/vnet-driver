@@ -1,6 +1,6 @@
 /**
  * @file vnet_main.c
- * @brief Minimal virtual Ethernet network driver (Phase 2).
+ * @brief Minimal virtual Ethernet network driver (Phase 4: TX/RX rings and timer-based RX).
  *
  * This module registers a simple virtual network interface (e.g. vnet0)
  * and wires up basic net_device operations (open/stop/start_xmit).
@@ -9,11 +9,12 @@
  *   - Allocates a struct net_device with private data.
  *   - Registers the device with the kernel networking stack.
  *   - Exposes a virtual interface visible via "ip link".
- *   - Drops all outgoing packets (no real TX/RX yet).
+ *   - Implements a TX ring to queue outgoing packets.
+ *   - Implements an RX ring fed by a timer that simulates incoming packets.
+ *   - Still drops all packets instead of handing them to the networking stack (learning phase).
  *
  * Later phases will add:
- *   - TX/RX rings.
- *   - NAPI.
+ *   - NAPI integration and real packet delivery to the networking stack.
  *   - A user-space backend to exchange packets.
  */
 
@@ -24,6 +25,8 @@
 #include <linux/netdevice.h>   /**< Core networking structures: struct net_device, net_device_ops */
 #include <linux/etherdevice.h> /**< Helpers for Ethernet devices: alloc_etherdev(), ether_addr_copy() */
 #include <linux/spinlock.h>    /**< spinlock_t and related APIs */
+#include <linux/timer.h>       /**< Kernel timers: struct timer_list, mod_timer(), etc. */
+#include <linux/string.h>      /**< String helpers like strlen(), memcpy() */
 
 /**
  * @brief Size of the transmit ring.
@@ -46,6 +49,27 @@ struct vnet_tx_slot {
 };
 
 /**
+ * @brief Size of the receive ring.
+ *
+ * This defines how many packets can be buffered by the driver on the
+ * receive side before they are processed. In a real NIC, this is often
+ * negotiated with the hardware.
+ */
+#define VNET_RX_RING_SIZE 64
+
+/**
+ * @brief Single receive ring slot.
+ *
+ * Each slot in the RX ring holds one sk_buff pointer and a flag
+ * indicating whether the slot is currently in use.
+ */
+struct vnet_rx_slot {
+    struct sk_buff *skb;  /**< Packet buffer received from "hardware" */
+    bool used;            /**< True if this slot is occupied */
+};
+
+
+/**
  * @brief Per-device private data for the vnet driver.
  *
  * One instance of this structure is allocated for each network interface
@@ -61,7 +85,22 @@ struct vnet_priv {
     struct vnet_tx_slot tx_ring[VNET_TX_RING_SIZE]; /**< Fixed-size circular buffer for TX packets */
     u16 tx_head;                                    /**< Index where the next packet will be enqueued */
     u16 tx_tail;                                    /**< Index where the next packet will be dequeued */
+
+    /* ------------------ RX ring state ------------------ */
+
+    struct vnet_rx_slot rx_ring[VNET_RX_RING_SIZE]; /**< Fixed-size circular buffer for RX packets */
+    u16 rx_head;                                    /**< Index where the next packet will be written */
+    u16 rx_tail;                                    /**< Index where the next packet will be read */
+
+    /* ------------------ RX packet generator ------------ */
+
+    struct timer_list rx_timer;                     /**< Timer that simulates incoming packets */
 };
+
+
+/* ====================================================================== */
+/*                          TX ring helpers                               */
+/* ====================================================================== */
 
 /**
  * @brief Check if the TX ring is full.
@@ -112,8 +151,8 @@ static void vnet_tx_ring_init(struct vnet_priv *priv)
 /**
  * @brief Enqueue a packet into the TX ring.
  *
- * If the ring is full, the function returns -ENOSPC and the caller
- * is responsible for handling the failure (e.g. stop the TX queue).
+ * If the ring is full, the packet is not enqueued and -ENOSPC is
+ * returned to the caller.
  *
  * @param priv Pointer to the driver's private data.
  * @param skb  Packet to enqueue.
@@ -163,12 +202,11 @@ static struct sk_buff *vnet_tx_dequeue(struct vnet_priv *priv)
 }
 
 /**
- * @brief Synchronous TX completion path (Phase 3).
+ * @brief Complete all pending TX packets.
  *
- * In a real driver, hardware would notify completion via interrupts
- * or polling (NAPI). For learning purposes, we simulate immediate
- * completion by draining the TX ring in a tight loop and freeing
- * all queued packets.
+ * In a real driver, completion is usually triggered by hardware
+ * interrupts. For this learning driver we simulate completion by
+ * draining the ring whenever we transmit.
  *
  * @param dev Pointer to the network device.
  */
@@ -185,6 +223,182 @@ static void vnet_tx_complete_all(struct net_device *dev)
 
     if (count > 0)
         pr_debug("vnet: completed %u TX packets\n", count);
+}
+
+
+/* ====================================================================== */
+/*                          RX ring helpers                               */
+/* ====================================================================== */
+
+/**
+ * @brief Check if the RX ring is full.
+ *
+ * The ring is considered full if the slot at rx_head is already
+ * in use. In that case, new packets must be dropped or back-pressured.
+ *
+ * @param priv Pointer to the driver's private data.
+ * @return true if the ring is full, false otherwise.
+ */
+static bool vnet_rx_ring_full(struct vnet_priv *priv)
+{
+    return priv->rx_ring[priv->rx_head].used;
+}
+
+/**
+ * @brief Check if the RX ring is empty.
+ *
+ * The ring is empty if the slot at rx_tail is not in use.
+ *
+ * @param priv Pointer to the driver's private data.
+ * @return true if the ring is empty, false otherwise.
+ */
+static bool vnet_rx_ring_empty(struct vnet_priv *priv)
+{
+    return !priv->rx_ring[priv->rx_tail].used;
+}
+
+/**
+ * @brief Initialize the RX ring.
+ *
+ * Resets head/tail indices and marks all slots as unused.
+ *
+ * @param priv Pointer to the driver's private data.
+ */
+static void vnet_rx_ring_init(struct vnet_priv *priv)
+{
+    int i;
+
+    priv->rx_head = 0;
+    priv->rx_tail = 0;
+
+    for (i = 0; i < VNET_RX_RING_SIZE; ++i) {
+        priv->rx_ring[i].skb = NULL;
+        priv->rx_ring[i].used = false;
+    }
+}
+
+/**
+ * @brief Enqueue a received packet into the RX ring.
+ *
+ * @param priv Pointer to the driver's private data.
+ * @param skb  Packet to enqueue.
+ * @return 0 on success, -ENOSPC if the ring is full.
+ */
+static int vnet_rx_enqueue(struct vnet_priv *priv, struct sk_buff *skb)
+{
+    struct vnet_rx_slot *slot;
+
+    if (vnet_rx_ring_full(priv))
+        return -ENOSPC;
+
+    slot = &priv->rx_ring[priv->rx_head];
+    slot->skb = skb;
+    slot->used = true;
+
+    priv->rx_head = (priv->rx_head + 1U) % VNET_RX_RING_SIZE;
+
+    return 0;
+}
+
+/**
+ * @brief Dequeue a packet from the RX ring.
+ *
+ * @param priv Pointer to the driver's private data.
+ * @return Pointer to the dequeued sk_buff, or NULL if the ring is empty.
+ */
+static struct sk_buff *vnet_rx_dequeue(struct vnet_priv *priv)
+{
+    struct vnet_rx_slot *slot;
+    struct sk_buff *skb;
+
+    if (vnet_rx_ring_empty(priv))
+        return NULL;
+
+    slot = &priv->rx_ring[priv->rx_tail];
+    skb = slot->skb;
+
+    slot->skb = NULL;
+    slot->used = false;
+
+    priv->rx_tail = (priv->rx_tail + 1U) % VNET_RX_RING_SIZE;
+
+    return skb;
+}
+
+/**
+ * @brief Process all packets currently queued in the RX ring.
+ *
+ * In a production driver this function (or NAPI poll) would deliver
+ * packets to the networking stack via netif_receive_skb() or variants.
+ * For learning purposes, we simply log and free each packet.
+ *
+ * @param dev Pointer to the network device.
+ */
+static void vnet_rx_process_all(struct net_device *dev)
+{
+    struct vnet_priv *priv = netdev_priv(dev);
+    struct sk_buff *skb;
+    unsigned int count = 0;
+
+    while ((skb = vnet_rx_dequeue(priv)) != NULL) {
+        pr_debug("vnet: RX packet of length %u bytes on %s\n",
+                 skb->len, dev->name);
+
+        dev_kfree_skb_any(skb);
+        count++;
+    }
+
+    if (count > 0)
+        pr_info("vnet: processed %u RX packets on %s\n", count, dev->name);
+}
+
+/**
+ * @brief RX timer callback: simulate incoming packets.
+ *
+ * This function is called periodically by the kernel timer. It simulates
+ * incoming packets by allocating an sk_buff with a small text payload,
+ * enqueuing it into the RX ring, and then processing the ring.
+ *
+ * @param t Pointer to the timer_list embedded in vnet_priv.
+ */
+static void vnet_rx_timer_fn(struct timer_list *t)
+{
+    struct vnet_priv *priv = from_timer(priv, t, rx_timer);
+    struct net_device *dev = priv->dev;
+    struct sk_buff *skb;
+    const char *msg = "Hello from vnet RX";
+    size_t msg_len = strlen(msg);
+    int ret;
+
+    /* Allocate an sk_buff with room for our dummy payload. */
+    skb = netdev_alloc_skb_ip_align(dev, msg_len);
+    if (!skb) {
+        pr_warn("vnet: RX timer failed to allocate skb\n");
+        goto out_rearm;
+    }
+
+    /* Copy the dummy payload into the skb's data area. */
+    memcpy(skb_put(skb, msg_len), msg, msg_len);
+
+    /* Enqueue into the RX ring under lock. */
+    spin_lock(&priv->lock);
+    ret = vnet_rx_enqueue(priv, skb);
+    if (ret) {
+        spin_unlock(&priv->lock);
+        pr_warn("vnet: RX ring full, dropping simulated packet\n");
+        dev_kfree_skb_any(skb);
+        goto out_rearm;
+    }
+
+    /* Process everything currently in the RX ring.
+     * In a later phase this will be replaced with NAPI scheduling.
+     */
+    vnet_rx_process_all(dev);
+    spin_unlock(&priv->lock);
+
+out_rearm:
+    /* Rearm the timer to fire again in 1 second. */
+    mod_timer(&priv->rx_timer, jiffies + msecs_to_jiffies(1000));
 }
 
 
@@ -210,7 +424,7 @@ static struct net_device *vnet_dev;
  *
  * Typical responsibilities here include starting the TX queue and
  * initializing hardware. Since this is a virtual device, we only start
- * the queue and log a message.
+ * the queue, initialize our rings, and start the RX timer.
  *
  * @param dev Pointer to the network device being opened.
  * @return 0 on success, negative error code on failure.
@@ -219,14 +433,17 @@ static int vnet_open(struct net_device *dev)
 {
     struct vnet_priv *priv = netdev_priv(dev);
 
-    /* Initialize the TX ring each time the device is opened. */
-    /* We use spin_lock_bh() instead of plain spin_lock() here since these paths can involve softirqs in real drivers. */
-    /* It’s a good habit for networking code. */
+    /* Initialize the TX and RX rings each time the device is opened. */
     spin_lock_bh(&priv->lock);
     vnet_tx_ring_init(priv);
+    vnet_rx_ring_init(priv);
     spin_unlock_bh(&priv->lock);
 
-    netif_start_queue(dev);    /* Enable the transmit queue so the stack can send packets */
+    /* Set up and start the RX timer to simulate incoming packets. */
+    timer_setup(&priv->rx_timer, vnet_rx_timer_fn, 0);
+    mod_timer(&priv->rx_timer, jiffies + msecs_to_jiffies(1000));
+
+    netif_start_queue(dev);    /**< Enable the transmit queue so the stack can send packets */
     pr_info("vnet: device %s opened\n", dev->name);
     return 0;
 }
@@ -240,7 +457,8 @@ static int vnet_open(struct net_device *dev)
  *   ip link set vnet0 down
  *
  * Typical responsibilities include stopping the TX queue and shutting
- * down hardware. Here we only stop the queue and log a message.
+ * down hardware. Here we stop the queue, cancel the RX timer, and
+ * drain all pending packets from TX and RX rings.
  *
  * @param dev Pointer to the network device being stopped.
  * @return 0 on success, negative error code on failure.
@@ -250,13 +468,18 @@ static int vnet_stop(struct net_device *dev)
     struct vnet_priv *priv = netdev_priv(dev);
     struct sk_buff *skb;
 
-    netif_stop_queue(dev);     /* Disable the transmit queue to stop new packets */
+    netif_stop_queue(dev);     /**< Disable the transmit queue to stop new packets */
 
-    /* Drain any remaining packets in the TX ring. */
+    /* Stop the RX timer and wait for any running callback. */
+    del_timer_sync(&priv->rx_timer);
+
+    /* Drain any remaining packets in the TX and RX rings. */
     spin_lock_bh(&priv->lock);
-    while ((skb = vnet_tx_dequeue(priv)) != NULL) {
+    while ((skb = vnet_tx_dequeue(priv)) != NULL)
         dev_kfree_skb_any(skb);
-    }
+
+    while ((skb = vnet_rx_dequeue(priv)) != NULL)
+        dev_kfree_skb_any(skb);
     spin_unlock_bh(&priv->lock);
 
     pr_info("vnet: device %s stopped\n", dev->name);
@@ -269,9 +492,9 @@ static int vnet_stop(struct net_device *dev)
  * This function is called whenever the kernel has an outgoing packet
  * to send through this interface. The packet is provided as an sk_buff.
  *
- * For now, this implementation simply drops the packet and reports
- * success. In later phases, this function will enqueue the packet into
- * a TX ring and schedule transmission.
+ * For now, this implementation enqueues the packet into a TX ring and
+ * immediately simulates completion. Later phases may move completion
+ * to a separate context (e.g. timer, NAPI).
  *
  * @param skb Pointer to the socket buffer (packet) to transmit.
  * @param dev Pointer to the network device through which the packet is sent.
@@ -282,7 +505,6 @@ static netdev_tx_t vnet_start_xmit(struct sk_buff *skb, struct net_device *dev)
     struct vnet_priv *priv = netdev_priv(dev);
     int ret;
 
-    /* Acquire lock to protect the TX ring. */
     spin_lock(&priv->lock);
 
     if (vnet_tx_ring_full(priv)) {
@@ -300,8 +522,8 @@ static netdev_tx_t vnet_start_xmit(struct sk_buff *skb, struct net_device *dev)
          * handle gracefully anyway.
          */
         spin_unlock(&priv->lock);
-        pr_err("vnet: failed to enqueue TX packet (err=%d)\n", ret);
-        dev_kfree_skb(skb);
+        pr_err("vnet: failed to enqueue TX packet on %s (ret=%d)\n", dev->name, ret);
+        dev_kfree_skb_any(skb);
         return NETDEV_TX_OK;
     }
 
@@ -319,7 +541,6 @@ static netdev_tx_t vnet_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
     return NETDEV_TX_OK;
 }
-
 
 /**
  * @brief net_device_ops structure for the vnet driver.
@@ -363,45 +584,26 @@ static int __init vnet_init(void)
 {
     int ret;
     struct vnet_priv *priv;
-
-    /** Locally administered, unicast MAC address for vnet0.
-     *
-     *  The first byte 0x02 indicates:
-     *    - Bit 0 (LSB) = 0 => unicast address.
-     *    - Bit 1       = 1 => locally administered (not globally unique).
-     *
-     *  This avoids conflicting with real hardware MAC addresses.
-     */
     static const unsigned char mac_addr[ETH_ALEN] = {
-        0x02, 0x12, 0x34, 0x56, 0x78, 0x9A
-    };
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x01
+    }; /**< Locally administered unicast MAC address */
 
-    /* Allocate an Ethernet device with private data for vnet_priv.
-     * alloc_etherdev() sets up:
-     *   - struct net_device
-     *   - Space for driver-specific private data
-     *   - Reasonable defaults for an Ethernet interface
+    /* Allocate an Ethernet device with private data. The sizeof(struct vnet_priv)
+     * is passed implicitly via alloc_etherdev().
      */
-    vnet_dev = alloc_etherdev(sizeof(struct vnet_priv));
+    vnet_dev = alloc_etherdev(sizeof(*priv));
     if (!vnet_dev) {
-        pr_err("vnet: failed to alloc_etherdev\n");
+        pr_err("vnet: failed to allocate net_device\n");
         return -ENOMEM;
     }
 
-    /* Set the name pattern for the device.
-     * The kernel will replace "%d" with a unique number, e.g. vnet0.
-     */
+    /* Set the name pattern (vnet0, vnet1, ...). */
     strscpy(vnet_dev->name, "vnet%d", IFNAMSIZ);
 
-    /* Connect our net_device_ops table so the kernel knows
-     * which functions to call for operations on this interface.
-     */
+    /* Hook up our net_device_ops. */
     vnet_dev->netdev_ops = &vnet_netdev_ops;
 
-    /* Access and initialize our private data area.
-     * netdev_priv() returns a pointer to the memory region reserved
-     * by alloc_etherdev().
-     */
+    /* Initialize the private data area. */
     priv = netdev_priv(vnet_dev);
     priv->dev = vnet_dev;
     spin_lock_init(&priv->lock);
@@ -410,23 +612,21 @@ static int __init vnet_init(void)
      * Set the hardware (MAC) address for this net_device.
      *
      * eth_hw_addr_set() is the preferred helper in modern kernels since
-     * it updates both dev->dev_addr and the internal bookkeeping fields
-     * that track how the address was assigned.
+     * it updates both dev->dev_addr and the internal bookkeeping the
+     * networking stack maintains.
      */
     eth_hw_addr_set(vnet_dev, mac_addr);
-       
-    /* Finally, register the device with the networking core.
-     * After this call succeeds, the device will be visible via "ip link".
-     */
+
+    /* Register the device with the networking core. */
     ret = register_netdev(vnet_dev);
     if (ret) {
-        pr_err("vnet: failed to register_netdev (err=%d)\n", ret);
+        pr_err("vnet: failed to register net_device (ret=%d)\n", ret);
         free_netdev(vnet_dev);
         vnet_dev = NULL;
         return ret;
     }
 
-    pr_info("vnet: virtual net device registered as %s\n", vnet_dev->name);
+    pr_info("vnet: registered device %s with MAC %pM\n", vnet_dev->name, vnet_dev->dev_addr);
     return 0;
 }
 
@@ -451,6 +651,6 @@ module_exit(vnet_exit);  /**< Register vnet_exit() as the module's exit point */
 
 MODULE_LICENSE("GPL");           /**< License: required to avoid "tainting" the kernel */
 MODULE_AUTHOR("Karan Gandhi");   /**< Author name for documentation and diagnostics */
-MODULE_DESCRIPTION("Minimal virtual network device (vnet0) - Phase 2");
-MODULE_VERSION("0.1");           /**< Driver version string */
+MODULE_DESCRIPTION("Minimal virtual network device (vnet0) - Phase 4 (TX/RX rings, timer-based RX)");
+MODULE_VERSION("0.4");           /**< Driver version string */
 

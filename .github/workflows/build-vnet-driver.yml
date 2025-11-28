@@ -1,0 +1,30 @@
+name: Build vnet-driver
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - "feature/*"
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential linux-headers-$(uname -r)
+
+      - name: Build kernel module
+        run: |
+          make
+
